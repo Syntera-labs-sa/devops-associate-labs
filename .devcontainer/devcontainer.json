@@ -1,0 +1,37 @@
+{
+  "name": "SynLearn DevOps Associate labs",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "moby": true,
+      "installDockerBuildx": true,
+      "dockerDashComposeVersion": "none"
+    },
+    "ghcr.io/devcontainers/features/terraform:1": {
+      "version": "1.12.2",
+      "tflint": "none",
+      "terragrunt": "none"
+    }
+  },
+  "hostRequirements": {
+    "cpus": 2
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "sudo install -m 0755 .synlearn/cli/synlearn /usr/local/bin/synlearn && synlearn --version",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "hashicorp.terraform",
+        "redhat.vscode-yaml"
+      ]
+    },
+    "codespaces": {
+      "openFiles": [
+        "README.md"
+      ]
+    }
+  }
+}

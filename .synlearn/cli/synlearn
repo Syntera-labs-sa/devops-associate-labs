@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""synlearn: run SynLearn DevOps Associate labs inside a GitHub Codespace.
+
+Python 3 standard library only. See labs/codespaces/DESIGN.md for the API contract.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+DEFAULT_API = "https://synlearn-api.synteralabs.co.za"
+LAB_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+RESULT_LINE = re.compile(r"^(PASS|FAIL)\b\s*(.*)$")
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+HTTP_TIMEOUT_SECONDS = 20
+DEFAULT_SCRIPT_TIMEOUT_SECONDS = 180
+MAX_REPORTED_LINES = 200
+MAX_MESSAGE_CHARS = 500
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_USAGE = 2
+EXIT_NOT_LOGGED_IN = 3
+EXIT_NETWORK = 4
+EXIT_UNKNOWN_LAB = 5
+
+
+class CliError(Exception):
+    """An error with a learner-facing message and an exit code."""
+
+    def __init__(self, message, exit_code=EXIT_FAILED):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+# ---------- output helpers ----------
+
+def use_colour():
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def paint(text, code):
+    if not use_colour():
+        return text
+    return "\033[%sm%s\033[0m" % (code, text)
+
+
+def green(text):
+    return paint(text, "32")
+
+
+def red(text):
+    return paint(text, "31")
+
+
+def bold(text):
+    return paint(text, "1")
+
+
+# ---------- configuration ----------
+
+def api_base():
+    base = os.environ.get("SYNLEARN_API", DEFAULT_API).rstrip("/")
+    parsed = urllib.parse.urlparse(base)
+    is_local = parsed.hostname in LOCAL_HOSTS
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and is_local):
+        raise CliError(
+            "SYNLEARN_API must be an https:// URL (plain http is allowed only for localhost).",
+            EXIT_USAGE,
+        )
+    return base
+
+
+def config_dir():
+    root = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(root, "synlearn")
+
+
+def token_path():
+    return os.path.join(config_dir(), "token")
+
+
+def read_token():
+    try:
+        with open(token_path(), encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except FileNotFoundError:
+        token = ""
+    if not token:
+        raise CliError(
+            "You are not logged in. Open the lesson page on SynLearn, copy your lab code, "
+            "then run: synlearn login <code>",
+            EXIT_NOT_LOGGED_IN,
+        )
+    return token
+
+
+def write_token(token):
+    os.makedirs(config_dir(), mode=0o700, exist_ok=True)
+    os.chmod(config_dir(), 0o700)
+    path = token_path()
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(token)
+    os.chmod(path, 0o600)
+
+
+def repo_root():
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return os.getcwd()
+    if completed.returncode == 0 and completed.stdout.strip():
+        return completed.stdout.strip()
+    return os.getcwd()
+
+
+def script_timeout():
+    raw = os.environ.get("SYNLEARN_SCRIPT_TIMEOUT", "")
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return DEFAULT_SCRIPT_TIMEOUT_SECONDS
+
+
+def validate_lab_id(lab_id):
+    if not LAB_ID_PATTERN.match(lab_id):
+        raise CliError(
+            "'%s' is not a valid lab id. Lab ids look like a07-first-image (lowercase, digits, dashes)."
+            % lab_id,
+            EXIT_USAGE,
+        )
+
+
+# ---------- HTTP ----------
+
+def request_json(method, path, body=None, token=None):
+    url = api_base() + path
+    data = None
+    headers = {"Accept": "application/json", "User-Agent": "synlearn-cli/" + VERSION}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        raise http_error(error) from error
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+        raise CliError(
+            "Could not reach SynLearn (%s). Check your internet connection and try again." % api_base(),
+            EXIT_NETWORK,
+        ) from error
+    try:
+        return json.loads(raw.decode("utf-8")) if raw else {}
+    except ValueError as error:
+        raise CliError("SynLearn sent a reply this CLI could not read. Try again later.") from error
+
+
+def server_message(error):
+    try:
+        payload = json.loads(error.read().decode("utf-8"))
+        detail = payload.get("error")
+        if isinstance(detail, dict):
+            return str(detail.get("message") or "")
+        return str(detail or "")
+    except (ValueError, AttributeError, OSError):
+        return ""
+
+
+def http_error(error):
+    detail = server_message(error)
+    if error.code == 401:
+        return CliError(
+            "Your lab login has expired or was revoked. Get a new code from the lesson page "
+            "and run: synlearn login <code>",
+            EXIT_NOT_LOGGED_IN,
+        )
+    if error.code == 404:
+        return CliError(detail or "SynLearn does not know that lab. Check the lab id on the lesson page.",
+                        EXIT_UNKNOWN_LAB)
+    if error.code == 429:
+        return CliError("Too many requests. Wait a minute and try again.", EXIT_NETWORK)
+    if error.code >= 500:
+        return CliError("SynLearn had a problem (HTTP %d). Try again in a few minutes." % error.code,
+                        EXIT_NETWORK)
+    return CliError(detail or "SynLearn refused the request (HTTP %d)." % error.code)
+
+
+# ---------- scripts ----------
+
+def parse_check_output(output, exit_code):
+    """Apply the terminal-lab contract: pass only if every line is PASS, there is one, and exit is 0."""
+    lines = []
+    for raw in output.splitlines():
+        match = RESULT_LINE.match(raw.strip())
+        if match:
+            lines.append({"status": match.group(1), "message": match.group(2)[:MAX_MESSAGE_CHARS]})
+    has_failure = any(line["status"] == "FAIL" for line in lines)
+    passed = bool(lines) and not has_failure and exit_code == 0
+    note = None
+    if not lines:
+        note = "The check did not report any results. Run `synlearn setup <lab-id>` and try again."
+    elif not has_failure and exit_code != 0:
+        note = "The check stopped with an error (exit code %d) before it finished." % exit_code
+    return {"passed": passed, "lines": lines[:MAX_REPORTED_LINES], "note": note}
+
+
+def run_script(script, cwd):
+    """Run a bash script from cwd with a timeout; return (combined output, exit code)."""
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False, encoding="utf-8") as handle:
+        handle.write(script)
+        script_file = handle.name
+    env = dict(os.environ, SYNLEARN_REPO_ROOT=cwd)
+    try:
+        completed = subprocess.run(
+            ["bash", script_file], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=script_timeout(), check=False,
+        )
+        return completed.stdout + completed.stderr, completed.returncode
+    except subprocess.TimeoutExpired:
+        return "FAIL The check took longer than %d seconds and was stopped.\n" % script_timeout(), 124
+    finally:
+        os.unlink(script_file)
+
+
+def fetch_lab(lab_id):
+    validate_lab_id(lab_id)
+    token = read_token()
+    lab = request_json("GET", "/api/labs/%s/check" % lab_id, token=token)
+    if not isinstance(lab, dict) or not isinstance(lab.get("check"), str):
+        raise CliError("SynLearn sent an incomplete lab definition for %s." % lab_id)
+    return lab, token
+
+
+# ---------- commands ----------
+
+def cmd_login(args):
+    code = args.code.strip()
+    if not re.match(r"^[A-Za-z0-9-]{4,64}$", code):
+        raise CliError("That does not look like a lab code. Copy it again from the lesson page.", EXIT_USAGE)
+    body = {
+        "code": code,
+        "github_user": os.environ.get("GITHUB_USER", ""),
+        "codespace": os.environ.get("CODESPACE_NAME", ""),
+    }
+    reply = request_json("POST", "/api/labs/link", body=body)
+    token = reply.get("token") if isinstance(reply, dict) else None
+    if not isinstance(token, str) or not token:
+        raise CliError("SynLearn did not return a lab login. Get a fresh code and try again.")
+    write_token(token)
+    link_id = reply.get("link_id")
+    if isinstance(link_id, str) and re.match(r"^[A-Za-z0-9_-]{8,128}$", link_id):
+        write_link_id(link_id)
+    who = reply.get("learner") or "your SynLearn account"
+    print(green("Logged in.") + " This codespace is now linked to %s." % who)
+    return EXIT_OK
+
+
+def write_link_id(link_id):
+    folder = os.path.join(repo_root(), ".synlearn")
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "link-id"), "w", encoding="utf-8") as handle:
+        handle.write(link_id + "\n")
+    print("Wrote .synlearn/link-id. Commit and push it so graded labs are credited to you.")
+
+
+def cmd_setup(args):
+    lab, _ = fetch_lab(args.lab_id)
+    setup = lab.get("setup")
+    if not isinstance(setup, str) or not setup.strip():
+        print("Lab %s has no setup step. You can start straight away." % args.lab_id)
+        return EXIT_OK
+    output, exit_code = run_script(setup, repo_root())
+    if output.strip():
+        print(output.rstrip())
+    if exit_code != 0:
+        raise CliError("Setup for %s failed (exit code %d)." % (args.lab_id, exit_code))
+    print(green("Setup done.") + " Starter files are ready for %s." % args.lab_id)
+    return EXIT_OK
+
+
+def cmd_check(args):
+    lab, token = fetch_lab(args.lab_id)
+    output, exit_code = run_script(lab["check"], repo_root())
+    verdict = parse_check_output(output, exit_code)
+    for line in verdict["lines"]:
+        label = green("PASS") if line["status"] == "PASS" else red("FAIL")
+        print("%s %s" % (label, line["message"]))
+    if verdict["note"]:
+        print(verdict["note"])
+    if verdict["passed"]:
+        print(bold(green("Lab %s passed." % args.lab_id)))
+    else:
+        print(bold(red("Lab %s not passed yet." % args.lab_id)))
+    report = {"lab_id": args.lab_id, "passed": verdict["passed"], "lines": verdict["lines"],
+              "exit_code": exit_code}
+    try:
+        request_json("POST", "/api/labs/%s/result" % args.lab_id, body=report, token=token)
+    except CliError as error:
+        print("Warning: your result was not saved to SynLearn. %s" % error, file=sys.stderr)
+    return EXIT_OK if verdict["passed"] else EXIT_FAILED
+
+
+def cmd_status(_args):
+    print("synlearn %s" % VERSION)
+    print("API:        %s" % api_base())
+    print("GitHub:     %s" % (os.environ.get("GITHUB_USER") or "(not in a codespace)"))
+    print("Codespace:  %s" % (os.environ.get("CODESPACE_NAME") or "(not in a codespace)"))
+    print("Repo root:  %s" % repo_root())
+    logged_in = os.path.isfile(token_path()) and os.path.getsize(token_path()) > 0
+    print("Logged in:  %s" % ("yes" if logged_in else "no (run: synlearn login <code>)"))
+    return EXIT_OK
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="synlearn",
+        description="Run SynLearn DevOps Associate labs in this codespace.",
+        epilog="Never put real cloud keys in this codespace. Docs: README.md in the repo root.",
+    )
+    parser.add_argument("--version", action="version", version="synlearn " + VERSION)
+    commands = parser.add_subparsers(dest="command", metavar="<command>")
+    login = commands.add_parser("login", help="link this codespace to your SynLearn account")
+    login.add_argument("code", help="the one-time code shown on the lesson page")
+    login.set_defaults(handler=cmd_login)
+    setup = commands.add_parser("setup", help="create a lab's starter files")
+    setup.add_argument("lab_id", help="lab id, e.g. a07-first-image")
+    setup.set_defaults(handler=cmd_setup)
+    check = commands.add_parser("check", help="check your work on a lab")
+    check.add_argument("lab_id", help="lab id, e.g. a07-first-image")
+    check.set_defaults(handler=cmd_check)
+    status = commands.add_parser("status", help="show login and environment details")
+    status.set_defaults(handler=cmd_status)
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "handler", None):
+        parser.print_help()
+        return EXIT_USAGE
+    try:
+        return args.handler(args)
+    except CliError as error:
+        print(red("Error: ") + str(error), file=sys.stderr)
+        return error.exit_code
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

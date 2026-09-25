@@ -1,0 +1,23 @@
+# Grades the labs listed in .synlearn/graded-labs on every push.
+# The checks live in Syntera-labs-sa/synlearn-checks so they cannot be edited here.
+# Do not change this file: SynLearn only accepts results from the pinned checks release.
+name: SynLearn graded labs
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: synlearn-graded-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  grade:
+    permissions:
+      id-token: write
+      contents: read
+    uses: Syntera-labs-sa/synlearn-checks/.github/workflows/check.yml@v1
+    with:
+      labs-file: .synlearn/graded-labs
