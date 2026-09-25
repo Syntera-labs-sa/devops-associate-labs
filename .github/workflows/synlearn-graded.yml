@@ -15,6 +15,8 @@ concurrency:
 
 jobs:
   grade:
+    # Runs only in a learner's own copy, never in the Syntera Labs template itself.
+    if: github.repository_owner != 'Syntera-labs-sa'
     permissions:
       id-token: write
       contents: read
