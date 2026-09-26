@@ -20,6 +20,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: Syntera-labs-sa/synlearn-checks/.github/workflows/check.yml@v1
+    uses: Syntera-labs-sa/synlearn-checks/.github/workflows/check.yml@v2
     with:
       labs-file: .synlearn/graded-labs
